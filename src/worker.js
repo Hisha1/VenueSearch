@@ -5,7 +5,14 @@
  *
  *   GET /api/contact?name=&lat=&lon=&address=&website=&email=&phone=
  *
- * It finds a venue's public contact details so a quote request can be sent straight to them:
+ *   GET /api/venues?lat=&lon=&miles=
+ *
+ * A backup route for venue search. The page asks the public OpenStreetMap (Overpass) servers
+ * directly first; when they refuse or time out, it asks here. This asks the same servers from
+ * Cloudflare (trying each mirror in turn) and caches answers for a day. If they all fail and a
+ * GOOGLE_PLACES_KEY secret is set, Google Places Nearby Search is used instead.
+ *
+ * /api/contact finds a venue's public contact details so a quote request can be sent straight to them:
  *   1. Any email/phone already known from OpenStreetMap (passed in by the page).
  *   2. If the venue has no website and a GOOGLE_PLACES_KEY secret is set, Google Places
  *      (Text Search) is asked for the website and phone number.
@@ -31,6 +38,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === "/api/contact") return handleContact(request, env, ctx);
+    if (url.pathname === "/api/venues") return handleVenues(request, env, ctx);
     if (url.pathname.startsWith("/api/")) return json({ error: "Not found" }, 404);
     return env.ASSETS.fetch(request);
   }
@@ -108,6 +116,116 @@ export async function lookupContact(input, env = {}) {
     contactPage: found.contactPage,
     sources
   };
+}
+
+/* ---------- venues (backup route) ---------- */
+
+const OVERPASS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.private.coffee/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter"
+];
+const VENUE_BUDGET_MS = 20000;
+const KEEP_TAGS = ["name", "amenity", "tourism", "capacity", "capacity:persons", "cuisine", "outdoor_seating", "beer_garden",
+  "addr:housenumber", "addr:street", "addr:city", "phone", "contact:phone", "email", "contact:email", "website", "contact:website"];
+
+async function handleVenues(request, env, ctx) {
+  const q = new URL(request.url).searchParams;
+  const lat = parseFloat(q.get("lat")), lon = parseFloat(q.get("lon")), miles = parseFloat(q.get("miles"));
+  if (!(Math.abs(lat) <= 90 && Math.abs(lon) <= 180 && miles > 0 && miles <= 10.5)) {
+    return json({ error: "lat, lon and miles (up to 10) are required" }, 400);
+  }
+  const key = new Request(`https://cache.venuesearch.internal/venues?lat=${lat.toFixed(3)}&lon=${lon.toFixed(3)}&miles=${miles}`);
+  const cache = typeof caches !== "undefined" ? caches.default : null;
+  if (cache) {
+    const hit = await cache.match(key);
+    if (hit) return hit;
+  }
+  const deadline = Date.now() + VENUE_BUDGET_MS;
+  let elements = await overpassVenues(lat, lon, miles, deadline);
+  let source = "openstreetmap";
+  if (!elements && env.GOOGLE_PLACES_KEY) {
+    elements = await googleNearby(lat, lon, miles, env.GOOGLE_PLACES_KEY, deadline).catch(() => null);
+    source = "google";
+  }
+  if (!elements) return json({ error: "Venue servers are busy. Try again shortly." }, 503);
+  const res = json({ source, elements }, 200, { "Cache-Control": "public, max-age=86400" });
+  if (cache && ctx && ctx.waitUntil) ctx.waitUntil(cache.put(key, res.clone()));
+  return res;
+}
+
+export function overpassQuery(lat, lon, miles) {
+  const around = `(around:${Math.round(miles * 1609.344)},${lat},${lon})`;
+  return "[out:json][timeout:15];(" +
+    `nwr["amenity"~"^(restaurant|bar|pub|biergarten|nightclub|events_venue|community_centre|conference_centre)$"]["name"]${around};` +
+    `nwr["tourism"="hotel"]["name"]${around};` +
+    ");out center tags 800;";
+}
+
+async function overpassVenues(lat, lon, miles, deadline) {
+  const body = "data=" + encodeURIComponent(overpassQuery(lat, lon, miles));
+  for (const url of OVERPASS) {
+    const left = deadline - Date.now();
+    if (left < 1000) break;
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": UA, Accept: "application/json" },
+        body,
+        signal: AbortSignal.timeout(Math.min(9000, left))
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const els = data.elements || [];
+      if (!els.length && data.remark && /error|timed out|out of memory/i.test(data.remark)) continue;
+      return els.map((el) => {
+        const tags = {};
+        for (const k of KEEP_TAGS) if (el.tags && el.tags[k] != null) tags[k] = el.tags[k];
+        return { type: el.type, id: el.id, lat: el.lat ?? el.center?.lat, lon: el.lon ?? el.center?.lon, tags };
+      });
+    } catch {
+      /* try the next mirror */
+    }
+  }
+  return null;
+}
+
+const GOOGLE_TYPE_MAP = {
+  restaurant: "restaurant", bar: "bar", pub: "pub", night_club: "nightclub", event_venue: "events_venue",
+  banquet_hall: "events_venue", wedding_venue: "events_venue", convention_center: "conference_centre",
+  community_center: "community_centre", hotel: "hotel"
+};
+
+async function googleNearby(lat, lon, miles, key, deadline) {
+  const res = await fetch("https://places.googleapis.com/v1/places:searchNearby", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": key,
+      "X-Goog-FieldMask": "places.id,places.displayName,places.location,places.types,places.formattedAddress,places.websiteUri,places.nationalPhoneNumber"
+    },
+    body: JSON.stringify({
+      includedTypes: ["restaurant", "bar", "night_club", "event_venue", "banquet_hall", "convention_center", "community_center"],
+      maxResultCount: 20,
+      rankPreference: "DISTANCE",
+      locationRestriction: { circle: { center: { latitude: lat, longitude: lon }, radius: Math.min(50000, miles * 1609.344) } }
+    }),
+    signal: AbortSignal.timeout(Math.max(1000, Math.min(8000, deadline - Date.now())))
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return (data.places || []).map((p) => {
+    const t = (p.types || []).find((x) => GOOGLE_TYPE_MAP[x]);
+    const kind = GOOGLE_TYPE_MAP[t] || "restaurant";
+    const tags = {
+      name: p.displayName && p.displayName.text,
+      website: p.websiteUri || undefined,
+      phone: p.nationalPhoneNumber || undefined,
+      "addr:street": (p.formattedAddress || "").split(",")[0] || undefined
+    };
+    if (kind === "hotel") tags.tourism = "hotel"; else tags.amenity = kind;
+    return { type: "google", id: p.id, lat: p.location.latitude, lon: p.location.longitude, tags };
+  }).filter((e) => e.tags.name);
 }
 
 /* ---------- Google Places (optional) ---------- */

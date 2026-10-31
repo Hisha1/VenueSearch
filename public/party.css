@@ -236,3 +236,13 @@ input[type="date"]::-webkit-calendar-picker-indicator, input[type="time"]::-webk
 .to-opt { display: flex; gap: 10px; align-items: center; font-weight: 400; cursor: pointer; overflow-wrap: anywhere; }
 .to-opt input { width: auto; accent-color: var(--pink); }
 @media (prefers-reduced-motion: reduce) { .fade-in { animation: none; } }
+
+/* contact details on venue cards */
+.venue { cursor: pointer; }
+.contact-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; font-size: .9rem; margin: -2px 0 10px; min-height: 1.4em; overflow-wrap: anywhere; }
+.contact-line a { color: var(--text); text-decoration: none; font-weight: 600; }
+.contact-line a:hover { text-decoration: underline; }
+.contact-line a.email { color: var(--yellow); }
+.contact-line .dot { color: var(--muted); }
+.link-btn { font: inherit; background: none; border: 0; padding: 0; color: var(--pink); cursor: pointer; font-weight: 700; }
+.link-btn.copy { font-size: .78rem; font-weight: 500; color: var(--muted); text-decoration: underline; }

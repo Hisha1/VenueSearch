@@ -8,6 +8,9 @@
   var MIN_DAYS_NOTICE = 5;
   var MILE_M = 1609.344;
   var PAGE_SIZE = 5;
+  var SEARCH_BUDGET_MS = 25000;   // a whole scouting run (address + venues) stays under 30 s
+  var REQUEST_TIMEOUT_MS = 12000; // one venue-server request
+  var HEDGE_MS = 3000;            // try the next venue server if the current one is this slow
   var STORE_KEY = "venuehunt.requests.v1";
   var OVERPASS = [
     "https://overpass-api.de/api/interpreter",
@@ -36,7 +39,7 @@
   };
 
   var $ = function (id) { return document.getElementById(id); };
-  var state = { origin: null, venues: [], byId: {}, steps: [], stepIndex: 0, covered: 0, shownCount: 5, search: null, active: null, map: null, layer: null, markers: {} };
+  var state = { origin: null, venues: [], byId: {}, steps: [], stepIndex: 0, covered: 0, shownCount: 5, run: 0, deadline: 0, rendered: {}, search: null, active: null };
 
   /* ---------- dates ---------- */
 
@@ -99,27 +102,56 @@
   function overpassQuery(o, miles) {
     var r = Math.round(miles * MILE_M);
     var around = "(around:" + r + "," + o.lat + "," + o.lon + ")";
-    return "[out:json][timeout:25];(" +
+    return "[out:json][timeout:12];(" +
       'nwr["amenity"~"^(restaurant|bar|pub|biergarten|nightclub|events_venue|community_centre|conference_centre)$"]["name"]' + around + ";" +
       'nwr["tourism"="hotel"]["name"]' + around + ";" +
-      ");out center tags 1500;";
+      ");out center tags 800;";
   }
 
-  function fetchVenues(o, miles) {
+  // Ask the public Overpass servers for venues within `miles`. The first server is tried
+  // right away; if it hasn't answered after HEDGE_MS (or fails), the next one is tried too,
+  // and the first good answer wins. Nothing runs past `deadline`.
+  function fetchVenues(o, miles, deadline) {
     var body = "data=" + encodeURIComponent(overpassQuery(o, miles));
-    var i = 0;
-    function attempt() {
-      return fetchJSON(OVERPASS[i], {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: body
-      }, 35000).catch(function (err) {
-        i++;
-        if (i < OVERPASS.length) return attempt();
-        throw err;
-      });
-    }
-    return attempt().then(function (json) { return (json.elements || []).map(function (el) { return toVenue(el, o); }).filter(Boolean); });
+    var budget = Math.min(REQUEST_TIMEOUT_MS, deadline - Date.now());
+    if (budget < 1000) return Promise.reject(new Error("TIMEOUT"));
+    return new Promise(function (resolve, reject) {
+      var started = {}, ctrls = [], timers = [], failures = 0, done = false;
+      function finish() {
+        done = true;
+        timers.forEach(clearTimeout);
+        ctrls.forEach(function (c) { try { c.abort(); } catch (e) { /* already done */ } });
+      }
+      function start(i) {
+        if (done || i >= OVERPASS.length || started[i]) return;
+        started[i] = true;
+        var c = new AbortController();
+        ctrls.push(c);
+        fetch(OVERPASS[i], {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: body,
+          signal: c.signal
+        })
+          .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+          .then(function (json) {
+            if (done) return;
+            var els = json.elements || [];
+            if (!els.length && json.remark && /error|timed out|out of memory/i.test(json.remark)) throw new Error("busy");
+            finish();
+            resolve(els.map(function (el) { return toVenue(el, o); }).filter(Boolean));
+          })
+          .catch(function () {
+            if (done) return;
+            failures++;
+            if (failures >= OVERPASS.length) { finish(); reject(new Error("FAILED")); return; }
+            for (var j = 0; j < OVERPASS.length; j++) if (!started[j]) { start(j); break; }
+          });
+      }
+      start(0);
+      for (var k = 1; k < OVERPASS.length; k++) timers.push(setTimeout(start.bind(null, k), HEDGE_MS * k));
+      timers.push(setTimeout(function () { if (!done) { finish(); reject(new Error("TIMEOUT")); } }, budget));
+    });
   }
 
   function toVenue(el, origin) {
@@ -405,11 +437,12 @@
   }
 
   // Venues are fetched in growing rings (each ring re-queries the full circle up to that
-  // distance), so the first 5 closest show quickly even for a 10-mile search.
+  // distance). The closest ring is small, so the first venues show up within seconds, and
+  // results are drawn after every ring while the next one loads.
   function radiusSteps(r) {
-    if (r <= 1) return [1];
-    if (r <= 5) return [1.5, 5];
-    return [1.5, 4, 10];
+    if (r <= 1) return [0.5, 1];
+    if (r <= 5) return [0.75, 2, 5];
+    return [0.75, 2.5, 5, 10];
   }
 
   function onSearch(e) {
@@ -421,6 +454,7 @@
     $("form-error").textContent = err;
     if (err) return;
 
+    var run = ++state.run;
     state.search = s;
     state.venues = [];
     state.byId = {};
@@ -428,41 +462,50 @@
     state.stepIndex = 0;
     state.covered = 0;
     state.usedDemo = false;
+    state.timedOut = false;
+    state.loadingMore = false;
+    state.rendered = {};
     state.shownCount = PAGE_SIZE;
+    state.deadline = Date.now() + SEARCH_BUDGET_MS;
     $("results").hidden = true;
     setLoading(true, "Checking the address…");
     resolveAddress(s.address)
       .then(function (o) {
+        if (run !== state.run) return;
         state.origin = o;
         setLoading(true, "Scouting the closest venues…");
-        return loadUntil(PAGE_SIZE, true);
+        return loadRing(run, true).then(function () {
+          if (run !== state.run) return;
+          setLoading(false);
+          render(true);
+          return keepLoading(run);
+        });
       })
-      .then(function () { render(true); })
       .catch(function (err) {
+        if (run !== state.run) return;
         $("form-error").hidden = false;
         $("form-error").textContent = err && err.message === "NOT_FOUND"
           ? "We couldn't find that address. Pick one of the suggestions as you type."
           : "We couldn't look up that address right now. Check your connection and try again.";
       })
-      .finally(function () { setLoading(false); });
+      .finally(function () { if (run === state.run) setLoading(false); });
   }
 
   function hasMoreRings() { return !state.usedDemo && state.stepIndex < state.steps.length; }
 
-  // Fetch rings until at least `need` matching venues are loaded or the radius is exhausted.
-  function loadUntil(need, first) {
-    if (filtered().length >= need || !hasMoreRings()) return Promise.resolve();
+  // Fetch the next ring. The very first ring falls back to sample venues if no server answers.
+  function loadRing(run, first) {
     var miles = state.steps[state.stepIndex];
-    return fetchVenues(state.origin, miles).then(function (venues) {
+    return fetchVenues(state.origin, miles, state.deadline).then(function (venues) {
+      if (run !== state.run) return;
       venues.forEach(function (v) {
         if (!state.byId[v.id]) { state.byId[v.id] = v; state.venues.push(v); }
       });
       state.covered = miles;
       state.stepIndex++;
-      return loadUntil(need, false);
     }, function (err) {
-      if (!first || state.venues.length) throw err;
-      // No live data at all: fall back to sample venues so the flow can still be tried.
+      if (run !== state.run) return;
+      if (!first) throw err;
       state.usedDemo = true;
       state.venues = demoVenues(state.origin, state.search.radius);
       state.covered = state.search.radius;
@@ -470,20 +513,38 @@
     });
   }
 
+  // Keep loading rings (redrawing after each) until enough venues fill the visible page,
+  // the radius is covered, or the time budget runs out.
+  function keepLoading(run) {
+    if (run !== state.run) return Promise.resolve();
+    if (filtered().length >= state.shownCount || !hasMoreRings()) {
+      state.loadingMore = false;
+      render(false);
+      return Promise.resolve();
+    }
+    if (Date.now() > state.deadline - 1000) {
+      state.loadingMore = false;
+      state.timedOut = true;
+      render(false);
+      return Promise.resolve();
+    }
+    state.loadingMore = true;
+    render(false);
+    return loadRing(run, false).then(function () {
+      return keepLoading(run);
+    }, function () {
+      if (run !== state.run) return;
+      state.loadingMore = false;
+      state.timedOut = true;
+      render(false);
+    });
+  }
+
   function onMore() {
-    var btn = $("more-btn");
     state.shownCount += PAGE_SIZE;
-    if (filtered().length >= state.shownCount || !hasMoreRings()) { render(false); return; }
-    btn.disabled = true;
-    btn.innerHTML = '<span class="mini-spin" aria-hidden="true"></span> Finding more venues…';
-    $("more-note").textContent = "";
-    loadUntil(state.shownCount, false)
-      .then(function () { render(false); })
-      .catch(function () {
-        state.shownCount -= PAGE_SIZE;
-        $("more-note").textContent = "Couldn't load more venues right now. Try again in a moment.";
-      })
-      .finally(function () { btn.disabled = false; btn.textContent = "Show 5 more venues"; });
+    state.timedOut = false;
+    state.deadline = Date.now() + SEARCH_BUDGET_MS;
+    keepLoading(state.run);
   }
 
   function filtered() {
@@ -516,7 +577,7 @@
     var more = list.length > shown.length || hasMoreRings();
 
     $("results").hidden = false;
-    $("results-title").textContent = list.length
+    $("results-title").textContent = shown.length || state.loadingMore
       ? "Spots that fit " + s.guests + " guests"
       : "No spots fit " + s.guests + " guests (yet)";
     $("results-sub").textContent =
@@ -525,19 +586,35 @@
       " · " + prettyDate(s.date) + " · showing " + shown.length + (more ? "" : " of " + list.length);
 
     var ul = $("venue-list");
-    if (!shown.length) {
+    if (!shown.length && !state.loadingMore && !(state.timedOut && hasMoreRings())) {
       ul.innerHTML = '<li class="empty card"><strong>Nothing big enough nearby 🫠</strong>' +
         "Try a wider radius, a different venue type, or a smaller guest count.</li>";
     } else {
-      ul.innerHTML = shown.map(function (v) { return venueCard(v, allowed); }).join("");
+      ul.innerHTML = shown.map(function (v, i) {
+        var fresh = !state.rendered[v.id];
+        state.rendered[v.id] = true;
+        return venueCard(v, allowed, fresh ? i : -1);
+      }).join("");
     }
-    $("more-btn").hidden = !more;
-    $("more-note").textContent = !more && shown.length ? "That's every spot we found within " + s.radius + " mi." : "";
-    drawMap(shown, scroll);
+
+    var note = $("more-note");
+    if (state.loadingMore) {
+      note.innerHTML = '<span class="mini-spin" aria-hidden="true"></span> Looking ' +
+        (shown.length ? "for more venues" : "a little farther out") + " (up to " + state.steps[state.stepIndex] + " mi)…";
+    } else if (state.timedOut && hasMoreRings()) {
+      note.textContent = "The venue servers are slow right now, so we stopped after " + Math.round(SEARCH_BUDGET_MS / 1000) +
+        " seconds. Tap the button to keep looking farther out.";
+    } else if (!more && shown.length) {
+      note.textContent = "That's every spot we found within " + s.radius + " mi.";
+    } else {
+      note.textContent = "";
+    }
+    $("more-btn").hidden = !more || state.loadingMore;
+    $("more-btn").textContent = shown.length < list.length ? "Show 5 more venues" : "Keep looking farther out";
     if (scroll) $("results").scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  function venueCard(v, allowed) {
+  function venueCard(v, allowed, delayIndex) {
     var capTag = v.capacitySource === "listed"
       ? '<span class="tag cap">👥 Up to ' + v.capacity + " guests</span>"
       : '<span class="tag cap">👥 ~' + v.capacity + ' guests</span><span class="tag est">estimated capacity</span>';
@@ -548,7 +625,11 @@
       : '<button class="pill primary small" disabled>Request availability &amp; quote</button>' +
         '<span class="why">Needs ' + MIN_DAYS_NOTICE + "+ days' notice</span>";
     var site = v.website ? '<a class="pill ghost small" href="' + esc(safeUrl(v.website)) + '" target="_blank" rel="noopener">Website ↗</a>' : "";
-    return '<li class="venue card" id="v-' + esc(v.id) + '" data-id="' + esc(v.id) + '">' +
+    var mapsQuery = v.address ? v.name + ", " + v.address : v.lat.toFixed(6) + "," + v.lon.toFixed(6);
+    site += '<a class="pill ghost small" href="https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(mapsQuery) +
+      '" target="_blank" rel="noopener">📍 Directions</a>';
+    var anim = delayIndex >= 0 ? ' fade-in" style="animation-delay:' + Math.min(delayIndex % PAGE_SIZE, 4) * 90 + 'ms' : "";
+    return '<li class="venue card' + anim + '" id="v-' + esc(v.id) + '" data-id="' + esc(v.id) + '">' +
       '<div class="emoji" aria-hidden="true">' + v.type.emoji + "</div>" +
       "<div><h3>" + esc(v.name) + '</h3><p class="meta">' + meta + "</p>" +
       '<div class="tags">' + capTag + cuisine + '<span class="tag">from ~' + money(v.quickQuote.perGuest) + "/guest</span></div>" +
@@ -561,47 +642,61 @@
     return u;
   }
 
-  /* ---------- map ---------- */
-
-  function drawMap(list, refit) {
-    if (!window.L) { $("map").hidden = true; $("map").parentNode.classList.add("no-map"); return; }
-    if (!state.map) {
-      state.map = L.map("map", { scrollWheelZoom: false });
-      // Leaflet needs a view before any layer is added, or drawing the circle throws.
-      state.map.setView([state.origin.lat, state.origin.lon], 13);
-      L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-        maxZoom: 19, subdomains: "abcd",
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
-      }).addTo(state.map);
-    }
-    if (state.layer) state.layer.remove();
-    state.layer = L.layerGroup().addTo(state.map);
-    state.markers = {};
-    var o = state.origin;
-    L.marker([o.lat, o.lon], { icon: L.divIcon({ className: "", html: '<div class="map-home"></div>', iconSize: [18, 18] }), title: "Your address" }).addTo(state.layer);
-    var circle = L.circle([o.lat, o.lon], { radius: state.search.radius * MILE_M, color: "#ff4fb8", weight: 1.5, fillOpacity: 0.05 }).addTo(state.layer);
-    list.forEach(function (v) {
-      var m = L.marker([v.lat, v.lon], {
-        icon: L.divIcon({ className: "", html: '<div class="map-pin">' + v.type.emoji + "</div>", iconSize: [24, 24], iconAnchor: [12, 12] }),
-        title: v.name
-      }).addTo(state.layer);
-      m.bindPopup("<strong>" + esc(v.name) + "</strong><br>" + esc(v.type.label) + " · " + v.distance.toFixed(1) + " mi");
-      m.on("click", function () { highlight(v.id, true); });
-      state.markers[v.id] = m;
-    });
-    setTimeout(function () {
-      state.map.invalidateSize();
-      if (refit) state.map.fitBounds(circle.getBounds(), { padding: [10, 10] });
-    }, 50);
-  }
-
-  function highlight(id, scroll) {
-    document.querySelectorAll(".venue.active").forEach(function (el) { el.classList.remove("active"); });
-    var el = document.getElementById("v-" + id);
-    if (el) { el.classList.add("active"); if (scroll) el.scrollIntoView({ behavior: "smooth", block: "center" }); }
-  }
-
   /* ---------- request + quote ---------- */
+
+  // Look up a venue's email / phone / contact page through the site's /api/contact Worker.
+  // OpenStreetMap details are used right away; the Worker adds what it finds on their website.
+  function lookupContact(v) {
+    if (v.contactLookup) return v.contactLookup;
+    var base = {
+      emails: v.email ? [{ email: v.email, source: "openstreetmap" }] : [],
+      phones: v.phone ? [v.phone] : [],
+      website: v.website || null,
+      contactPage: null
+    };
+    if (v.demo) { v.contactLookup = Promise.resolve(base); return v.contactLookup; }
+    var params = new URLSearchParams({
+      name: v.name, lat: v.lat.toFixed(6), lon: v.lon.toFixed(6),
+      address: v.address || "", website: v.website || "", email: v.email || "", phone: v.phone || ""
+    });
+    v.contactLookup = fetchJSON("/api/contact?" + params.toString(), {}, 15000)
+      .then(function (r) {
+        return {
+          emails: r.emails && r.emails.length ? r.emails : base.emails,
+          phones: r.phones && r.phones.length ? r.phones : base.phones,
+          website: r.website || base.website,
+          contactPage: r.contactPage || null
+        };
+      })
+      .catch(function () { base.failed = true; return base; });
+    return v.contactLookup;
+  }
+
+  var SOURCE_LABEL = { website: "from their website", openstreetmap: "listed on OpenStreetMap" };
+
+  function renderContact(v, c) {
+    if (state.active !== v) return;
+    v.contact = c;
+    var box = $("req-contact");
+    if (v.demo) {
+      box.innerHTML = '<span class="muted">Sample venue: there\'s no real contact to look up.</span>';
+      return;
+    }
+    if (c.emails.length) {
+      box.innerHTML = '<p class="contact-head">✉️ Your request will go to</p>' + c.emails.map(function (e, i) {
+        return '<label class="to-opt"><input type="radio" name="req-to" value="' + esc(e.email) + '"' + (i === 0 ? " checked" : "") + ">" +
+          '<span><strong>' + esc(e.email) + '</strong> <span class="muted">' + esc(SOURCE_LABEL[e.source] || "") + "</span></span></label>";
+      }).join("");
+      return;
+    }
+    var bits = [];
+    if (c.phones.length) bits.push("📞 " + esc(c.phones[0]));
+    if (c.contactPage) bits.push('<a href="' + esc(c.contactPage) + '" target="_blank" rel="noopener">contact page ↗</a>');
+    else if (c.website) bits.push('<a href="' + esc(safeUrl(c.website)) + '" target="_blank" rel="noopener">website ↗</a>');
+    box.innerHTML = '<p class="contact-head">' + (c.failed ? "⚠️ We couldn't look up their contact info right now." : "🔎 We couldn't find a public email for this venue.") + "</p>" +
+      '<p class="muted">' + (bits.length ? "Reach them by " + bits.join(" · ") + ". " : "") +
+      "You'll still get your quote and a ready-to-send message.</p>";
+  }
 
   function openRequest(id) {
     var v = state.venues.find(function (x) { return x.id === id; });
@@ -621,7 +716,9 @@
     if (v.type.group === "bar") $("req-style").value = "drinks";
     else if (v.key === "restaurant") $("req-style").value = "seated";
     else $("req-style").value = "buffet";
+    $("req-contact").innerHTML = '<span class="mini-spin" aria-hidden="true"></span> <span class="muted">Finding their email and contact info…</span>';
     $("request-dialog").showModal();
+    lookupContact(v).then(function (c) { renderContact(v, c); });
   }
 
   function submitRequest() {
@@ -629,7 +726,7 @@
     var req = {
       id: "req_" + Date.now().toString(36),
       venueId: v.id, venueName: v.name, venueType: v.type.label, venueAddress: v.address,
-      venuePhone: v.phone, venueEmail: v.email, venueWebsite: v.website, demo: v.demo,
+      venuePhone: v.phone, venueEmail: v.email, venueWebsite: v.website, venueContactPage: "", demo: v.demo,
       date: $("req-date").value, time: $("req-time").value, hours: +$("req-hours").value,
       guests: parseInt($("req-guests").value, 10), style: $("req-style").value,
       name: $("req-name").value.trim(), email: $("req-email").value.trim(), notes: $("req-notes").value.trim(),
@@ -648,6 +745,14 @@
     $("req-error").textContent = err;
     if (err) return;
 
+    var c = v.contact;
+    if (c) {
+      var to = document.querySelector('input[name="req-to"]:checked');
+      req.venueEmail = to ? to.value : (c.emails[0] && c.emails[0].email) || "";
+      req.venuePhone = c.phones[0] || req.venuePhone;
+      req.venueWebsite = c.website || req.venueWebsite;
+      req.venueContactPage = c.contactPage || "";
+    }
     req.quote = quoteFor(v, req);
     saveRequest(req);
     if (CONFIG.requestEndpoint) {
@@ -684,9 +789,10 @@
     if (req.demo) {
       actions.push('<span class="fine">This is a sample venue, so there\'s nobody to contact. Run a search with live data to reach real venues.</span>');
     } else {
-      if (req.venueEmail) actions.push('<a class="pill primary small" href="mailto:' + esc(req.venueEmail) + "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(requestText(req)) + '">✉️ Email the venue</a>');
+      if (req.venueEmail) actions.push('<a class="pill primary small" href="mailto:' + esc(req.venueEmail) + "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(requestText(req)) + '">✉️ Send to ' + esc(req.venueEmail) + "</a>");
+      if (req.venueContactPage) actions.push('<a class="pill ' + (req.venueEmail ? "ghost" : "primary") + ' small" href="' + esc(req.venueContactPage) + '" target="_blank" rel="noopener">📝 Their contact form</a>');
       if (req.venuePhone) actions.push('<a class="pill ghost small" href="tel:' + esc(req.venuePhone.replace(/[^\d+]/g, "")) + '">📞 ' + esc(req.venuePhone) + "</a>");
-      if (req.venueWebsite) actions.push('<a class="pill ghost small" href="' + esc(safeUrl(req.venueWebsite)) + '" target="_blank" rel="noopener">🌐 Book on their site</a>');
+      if (req.venueWebsite && !req.venueContactPage) actions.push('<a class="pill ghost small" href="' + esc(safeUrl(req.venueWebsite)) + '" target="_blank" rel="noopener">🌐 Book on their site</a>');
       if (!actions.length) actions.push('<a class="pill ghost small" target="_blank" rel="noopener" href="https://www.google.com/search?q=' + encodeURIComponent(req.venueName + " " + (req.venueAddress || "")) + '">🔎 Find their contact</a>');
     }
     actions.push('<button class="pill ghost small" type="button" id="copy-req">📋 Copy request</button>');
@@ -746,13 +852,7 @@
     $("sort").addEventListener("change", function () { if (state.search) render(); });
     $("venue-list").addEventListener("click", function (e) {
       var b = e.target.closest("[data-request]");
-      if (b) { openRequest(b.getAttribute("data-request")); return; }
-      var card = e.target.closest(".venue");
-      if (card && !e.target.closest("a,button")) {
-        var id = card.getAttribute("data-id"), m = state.markers[id];
-        highlight(id, false);
-        if (m && state.map) { state.map.setView(m.getLatLng(), Math.max(state.map.getZoom(), 15)); m.openPopup(); }
-      }
+      if (b) openRequest(b.getAttribute("data-request"));
     });
     $("req-submit").addEventListener("click", submitRequest);
     $("quote-close").addEventListener("click", function () { $("request-dialog").close(); });

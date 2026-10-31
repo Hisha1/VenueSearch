@@ -8,8 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
-<link rel="stylesheet" href="party.css?v=20261101">
+<link rel="stylesheet" href="party.css?v=20261102">
 </head>
 <body>
 <div class="blobs" aria-hidden="true">
@@ -91,7 +90,6 @@
     </div>
     <p class="results-sub" id="results-sub"></p>
     <div class="results-grid">
-      <div id="map" class="map card" role="img" aria-label="Map of venues"></div>
       <div>
         <ul class="venue-list" id="venue-list"></ul>
         <div class="more-wrap">
@@ -119,6 +117,7 @@
     <p class="eyebrow" id="req-venue-type"></p>
     <h3 id="req-venue-name">Venue</h3>
     <p class="muted" id="req-venue-meta"></p>
+    <div class="contact-box" id="req-contact" aria-live="polite"></div>
 
     <div class="req-grid">
       <div class="field"><label for="req-date">Date</label><input id="req-date" type="date" required></div>
@@ -151,7 +150,7 @@
     <h3 id="quote-title">Your quote</h3>
     <p class="muted" id="quote-sub"></p>
     <table class="quote-table" id="quote-table"></table>
-    <p class="fine">This is an estimate built from typical prices for this kind of venue. Availability and final pricing are confirmed by the venue. Send them your request below.</p>
+    <p class="fine">This is an estimate built from typical prices for this kind of venue. Availability and final pricing are confirmed by the venue. Send your request below: it opens your email with the message ready, so the venue replies straight to you.</p>
     <div class="modal-actions wrap" id="quote-actions"></div>
   </div>
 </dialog>
@@ -166,8 +165,7 @@
   </div>
 </dialog>
 
-<script src="vendor/leaflet/leaflet.js"></script>
-<script src="config.js?v=20261101"></script>
-<script src="party.js?v=20261101"></script>
+<script src="config.js?v=20261102"></script>
+<script src="party.js?v=20261102"></script>
 </body>
 </html>

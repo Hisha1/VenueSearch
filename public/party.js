@@ -2,13 +2,12 @@
 (function () {
   "use strict";
 
-  // Optional: set window.VENUE_HUNT_CONFIG = { requestEndpoint: "https://..." } before this
-  // script loads and every request will also be POSTed there as JSON.
+  // Settings live in config.js (Google Maps key for address suggestions, optional request endpoint).
   var CONFIG = window.VENUE_HUNT_CONFIG || {};
 
   var MIN_DAYS_NOTICE = 5;
   var MILE_M = 1609.344;
-  var MAX_LISTED = 60;
+  var PAGE_SIZE = 5;
   var STORE_KEY = "venuehunt.requests.v1";
   var OVERPASS = [
     "https://overpass-api.de/api/interpreter",
@@ -37,7 +36,7 @@
   };
 
   var $ = function (id) { return document.getElementById(id); };
-  var state = { origin: null, venues: [], search: null, active: null, map: null, layer: null, markers: {} };
+  var state = { origin: null, venues: [], byId: {}, steps: [], stepIndex: 0, covered: 0, shownCount: 5, search: null, active: null, map: null, layer: null, markers: {} };
 
   /* ---------- dates ---------- */
 
@@ -96,16 +95,6 @@
   }
 
   /* ---------- data ---------- */
-
-  function geocode(address) {
-    var m = address.trim().match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
-    if (m) return Promise.resolve({ lat: +m[1], lon: +m[2], label: address.trim() });
-    var url = "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=0&q=" + encodeURIComponent(address);
-    return fetchJSON(url, { headers: { "Accept-Language": navigator.language || "en" } }, 15000).then(function (rows) {
-      if (!rows || !rows.length) throw new Error("NOT_FOUND");
-      return { lat: +rows[0].lat, lon: +rows[0].lon, label: rows[0].display_name };
-    });
-  }
 
   function overpassQuery(o, miles) {
     var r = Math.round(miles * MILE_M);
@@ -212,6 +201,172 @@
     return { lines: lines, total: total, perGuest: total / guests, deposit: Math.round(total * 0.25) };
   }
 
+  /* ---------- address autocomplete + validation ---------- */
+
+  // Suggestions come from Google Places (when CONFIG.googleMapsApiKey is set) or from
+  // Photon, a free OpenStreetMap address search. Picking a suggestion validates the address
+  // and gives us its exact coordinates.
+  var addr = { selected: null, items: [], active: -1, seq: 0, timer: null, google: null, googleFailed: false, token: null };
+
+  function loadGoogle() {
+    if (addr.google) return addr.google;
+    addr.google = new Promise(function (resolve, reject) {
+      window.__venueHuntGoogleReady = function () {
+        google.maps.importLibrary("places").then(resolve, reject);
+      };
+      var s = document.createElement("script");
+      s.src = "https://maps.googleapis.com/maps/api/js?key=" + encodeURIComponent(CONFIG.googleMapsApiKey) +
+        "&loading=async&v=weekly&callback=__venueHuntGoogleReady";
+      s.async = true;
+      s.onerror = function () { reject(new Error("Google Maps failed to load")); };
+      document.head.appendChild(s);
+      setTimeout(function () { reject(new Error("Google Maps timed out")); }, 10000);
+    });
+    return addr.google;
+  }
+  function useGoogle() { return !!CONFIG.googleMapsApiKey && !addr.googleFailed; }
+
+  function googleSuggest(q) {
+    return loadGoogle().then(function (places) {
+      if (!addr.token) addr.token = new places.AutocompleteSessionToken();
+      return places.AutocompleteSuggestion.fetchAutocompleteSuggestions({ input: q, sessionToken: addr.token });
+    }).then(function (res) {
+      return (res.suggestions || []).filter(function (s) { return s.placePrediction; }).slice(0, 5).map(function (s) {
+        var p = s.placePrediction;
+        return {
+          main: p.mainText ? p.mainText.toString() : p.text.toString(),
+          sub: p.secondaryText ? p.secondaryText.toString() : "",
+          label: p.text.toString(),
+          resolve: function () {
+            var place = p.toPlace();
+            return place.fetchFields({ fields: ["formattedAddress", "location"] }).then(function () {
+              addr.token = null; // a pick ends the billing session
+              return { lat: place.location.lat(), lon: place.location.lng(), label: place.formattedAddress || p.text.toString() };
+            });
+          }
+        };
+      });
+    });
+  }
+
+  function photonSuggest(q) {
+    var url = "https://photon.komoot.io/api/?limit=5&q=" + encodeURIComponent(q);
+    return fetchJSON(url, {}, 8000).then(function (json) {
+      return (json.features || []).map(function (f) {
+        var p = f.properties || {}, c = f.geometry.coordinates;
+        var street = [p.housenumber, p.street].filter(Boolean).join(" ");
+        var main = p.name || street || p.city || p.state || "";
+        var subParts = [p.name && street && p.name !== street ? street : "", p.name !== p.city ? p.city : "", p.state, p.postcode, p.country];
+        var sub = subParts.filter(Boolean).join(", ");
+        var label = [main, sub].filter(Boolean).join(", ");
+        return { main: main, sub: sub, label: label, resolve: function () { return Promise.resolve({ lat: c[1], lon: c[0], label: label }); } };
+      }).filter(function (s) { return s.main; });
+    });
+  }
+
+  function suggest(q) {
+    if (useGoogle()) {
+      return googleSuggest(q).catch(function () { addr.googleFailed = true; return photonSuggest(q); });
+    }
+    return photonSuggest(q);
+  }
+
+  function setAddrStatus(text, cls) {
+    var el = $("addr-status");
+    el.textContent = text || "";
+    el.className = "addr-status" + (cls ? " " + cls : "");
+  }
+
+  function closeSuggestions() {
+    $("address-list").hidden = true;
+    $("address").setAttribute("aria-expanded", "false");
+    $("address").removeAttribute("aria-activedescendant");
+    addr.active = -1;
+  }
+
+  function renderSuggestions(items, emptyText) {
+    addr.items = items;
+    addr.active = -1;
+    var ul = $("address-list");
+    if (!items.length && !emptyText) { closeSuggestions(); return; }
+    ul.innerHTML = items.map(function (s, i) {
+      return '<li role="option" id="addr-opt-' + i + '" data-i="' + i + '" aria-selected="false"><span class="s-pin" aria-hidden="true">📍</span>' +
+        '<span><span class="s-main">' + esc(s.main) + '</span><br><span class="s-sub">' + esc(s.sub) + "</span></span></li>";
+    }).join("") + (items.length
+      ? '<li class="s-credit" aria-hidden="true">' + (useGoogle() ? "powered by Google" : "© OpenStreetMap") + "</li>"
+      : '<li class="s-empty">' + esc(emptyText) + "</li>");
+    ul.hidden = false;
+    $("address").setAttribute("aria-expanded", "true");
+  }
+
+  function moveActive(delta) {
+    if (!addr.items.length) return;
+    addr.active = (addr.active + delta + addr.items.length) % addr.items.length;
+    $("address-list").querySelectorAll('[role="option"]').forEach(function (li, i) {
+      li.setAttribute("aria-selected", i === addr.active ? "true" : "false");
+    });
+    $("address").setAttribute("aria-activedescendant", "addr-opt-" + addr.active);
+  }
+
+  function pickSuggestion(i) {
+    var s = addr.items[i];
+    if (!s) return Promise.resolve(null);
+    closeSuggestions();
+    $("address").value = s.label;
+    setAddrStatus("Checking address…");
+    return s.resolve().then(function (place) {
+      addr.selected = place;
+      $("address").value = place.label;
+      setAddrStatus("✓ Verified address", "ok");
+      return place;
+    }).catch(function () {
+      addr.selected = null;
+      setAddrStatus("We couldn't verify that one. Try another suggestion.", "warn");
+      return null;
+    });
+  }
+
+  function onAddressInput() {
+    addr.selected = null;
+    setAddrStatus("");
+    clearTimeout(addr.timer);
+    var q = $("address").value.trim();
+    if (q.length < 3) { closeSuggestions(); return; }
+    addr.timer = setTimeout(function () {
+      var seq = ++addr.seq;
+      suggest(q).then(function (items) {
+        if (seq !== addr.seq) return; // a newer keystroke won
+        renderSuggestions(items, "No matches yet. Keep typing or add a city.");
+      }).catch(function () {
+        if (seq === addr.seq) closeSuggestions();
+      });
+    }, 250);
+  }
+
+  function onAddressKey(e) {
+    var open = !$("address-list").hidden;
+    if (e.key === "ArrowDown") { e.preventDefault(); if (open) moveActive(1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); if (open) moveActive(-1); }
+    else if (e.key === "Enter" && open && addr.active >= 0) { e.preventDefault(); pickSuggestion(addr.active); }
+    else if (e.key === "Escape") { closeSuggestions(); }
+  }
+
+  // Resolve whatever is in the box to a validated place, for searches run without picking a suggestion.
+  function resolveAddress(text) {
+    if (addr.selected) return Promise.resolve(addr.selected);
+    var m = text.match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
+    if (m) return Promise.resolve({ lat: +m[1], lon: +m[2], label: text });
+    return suggest(text).then(function (items) {
+      if (!items.length) throw new Error("NOT_FOUND");
+      addr.items = items;
+      return pickSuggestion(0).then(function (place) {
+        if (!place) throw new Error("NOT_FOUND");
+        setAddrStatus("✓ Using the closest match: " + place.label, "ok");
+        return place;
+      });
+    });
+  }
+
   /* ---------- search ---------- */
 
   function readSearch() {
@@ -249,8 +404,17 @@
     }
   }
 
+  // Venues are fetched in growing rings (each ring re-queries the full circle up to that
+  // distance), so the first 5 closest show quickly even for a 10-mile search.
+  function radiusSteps(r) {
+    if (r <= 1) return [1];
+    if (r <= 5) return [1.5, 5];
+    return [1.5, 4, 10];
+  }
+
   function onSearch(e) {
     e.preventDefault();
+    closeSuggestions();
     var s = readSearch();
     var err = validateSearch(s);
     $("form-error").hidden = !err;
@@ -258,34 +422,75 @@
     if (err) return;
 
     state.search = s;
+    state.venues = [];
+    state.byId = {};
+    state.steps = radiusSteps(s.radius);
+    state.stepIndex = 0;
+    state.covered = 0;
+    state.usedDemo = false;
+    state.shownCount = PAGE_SIZE;
     $("results").hidden = true;
-    setLoading(true, "Finding " + s.address + "…");
-    var usedDemo = false;
-    geocode(s.address)
+    setLoading(true, "Checking the address…");
+    resolveAddress(s.address)
       .then(function (o) {
         state.origin = o;
-        setLoading(true, "Scouting venues within " + s.radius + " mile" + (s.radius > 1 ? "s" : "") + "…");
-        return fetchVenues(o, s.radius).catch(function () { usedDemo = true; return demoVenues(o, s.radius); });
+        setLoading(true, "Scouting the closest venues…");
+        return loadUntil(PAGE_SIZE, true);
       })
-      .then(function (venues) {
-        state.venues = venues;
-        state.usedDemo = usedDemo;
-        render(true);
-      })
+      .then(function () { render(true); })
       .catch(function (err) {
         $("form-error").hidden = false;
         $("form-error").textContent = err && err.message === "NOT_FOUND"
-          ? "We couldn't find that address. Try adding a city or ZIP code."
+          ? "We couldn't find that address. Pick one of the suggestions as you type."
           : "We couldn't look up that address right now. Check your connection and try again.";
       })
       .finally(function () { setLoading(false); });
+  }
+
+  function hasMoreRings() { return !state.usedDemo && state.stepIndex < state.steps.length; }
+
+  // Fetch rings until at least `need` matching venues are loaded or the radius is exhausted.
+  function loadUntil(need, first) {
+    if (filtered().length >= need || !hasMoreRings()) return Promise.resolve();
+    var miles = state.steps[state.stepIndex];
+    return fetchVenues(state.origin, miles).then(function (venues) {
+      venues.forEach(function (v) {
+        if (!state.byId[v.id]) { state.byId[v.id] = v; state.venues.push(v); }
+      });
+      state.covered = miles;
+      state.stepIndex++;
+      return loadUntil(need, false);
+    }, function (err) {
+      if (!first || state.venues.length) throw err;
+      // No live data at all: fall back to sample venues so the flow can still be tried.
+      state.usedDemo = true;
+      state.venues = demoVenues(state.origin, state.search.radius);
+      state.covered = state.search.radius;
+      state.stepIndex = state.steps.length;
+    });
+  }
+
+  function onMore() {
+    var btn = $("more-btn");
+    state.shownCount += PAGE_SIZE;
+    if (filtered().length >= state.shownCount || !hasMoreRings()) { render(false); return; }
+    btn.disabled = true;
+    btn.innerHTML = '<span class="mini-spin" aria-hidden="true"></span> Finding more venues…';
+    $("more-note").textContent = "";
+    loadUntil(state.shownCount, false)
+      .then(function () { render(false); })
+      .catch(function () {
+        state.shownCount -= PAGE_SIZE;
+        $("more-note").textContent = "Couldn't load more venues right now. Try again in a moment.";
+      })
+      .finally(function () { btn.disabled = false; btn.textContent = "Show 5 more venues"; });
   }
 
   function filtered() {
     var s = state.search;
     var seen = {};
     var list = state.venues.filter(function (v) {
-      if (v.distance > s.radius) return false;
+      if (v.distance > Math.min(s.radius, state.covered)) return false;
       if (v.capacity < s.guests) return false;
       if (s.kind !== "all" && v.type.group !== s.kind) return false;
       var k = v.name.toLowerCase() + "|" + v.lat.toFixed(3) + v.lon.toFixed(3);
@@ -306,17 +511,18 @@
   function render(scroll) {
     var s = state.search;
     var list = filtered();
-    var shown = list.slice(0, MAX_LISTED);
+    var shown = list.slice(0, state.shownCount);
     var allowed = canRequest(s.date);
+    var more = list.length > shown.length || hasMoreRings();
 
     $("results").hidden = false;
     $("results-title").textContent = list.length
-      ? list.length + " spot" + (list.length === 1 ? "" : "s") + " fit " + s.guests + " guests"
+      ? "Spots that fit " + s.guests + " guests"
       : "No spots fit " + s.guests + " guests (yet)";
     $("results-sub").textContent =
       (state.usedDemo ? "⚠️ Live venue data didn't load, so these are sample venues to try the flow with. " : "") +
       "Within " + s.radius + " mi of " + state.origin.label.split(",").slice(0, 3).join(",") +
-      " · " + prettyDate(s.date) + (list.length > shown.length ? " · showing the first " + shown.length : "");
+      " · " + prettyDate(s.date) + " · showing " + shown.length + (more ? "" : " of " + list.length);
 
     var ul = $("venue-list");
     if (!shown.length) {
@@ -325,7 +531,9 @@
     } else {
       ul.innerHTML = shown.map(function (v) { return venueCard(v, allowed); }).join("");
     }
-    drawMap(shown);
+    $("more-btn").hidden = !more;
+    $("more-note").textContent = !more && shown.length ? "That's every spot we found within " + s.radius + " mi." : "";
+    drawMap(shown, scroll);
     if (scroll) $("results").scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
@@ -355,10 +563,12 @@
 
   /* ---------- map ---------- */
 
-  function drawMap(list) {
+  function drawMap(list, refit) {
     if (!window.L) { $("map").hidden = true; $("map").parentNode.classList.add("no-map"); return; }
     if (!state.map) {
       state.map = L.map("map", { scrollWheelZoom: false });
+      // Leaflet needs a view before any layer is added, or drawing the circle throws.
+      state.map.setView([state.origin.lat, state.origin.lon], 13);
       L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
         maxZoom: 19, subdomains: "abcd",
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
@@ -379,7 +589,10 @@
       m.on("click", function () { highlight(v.id, true); });
       state.markers[v.id] = m;
     });
-    setTimeout(function () { state.map.invalidateSize(); state.map.fitBounds(circle.getBounds(), { padding: [10, 10] }); }, 50);
+    setTimeout(function () {
+      state.map.invalidateSize();
+      if (refit) state.map.fitBounds(circle.getBounds(), { padding: [10, 10] });
+    }, 50);
   }
 
   function highlight(id, scroll) {
@@ -518,6 +731,14 @@
     updateReqCount();
 
     $("search-form").addEventListener("submit", onSearch);
+    $("more-btn").addEventListener("click", onMore);
+    $("address").addEventListener("input", onAddressInput);
+    $("address").addEventListener("keydown", onAddressKey);
+    $("address").addEventListener("blur", function () { setTimeout(closeSuggestions, 150); });
+    $("address-list").addEventListener("mousedown", function (e) {
+      var li = e.target.closest("[data-i]");
+      if (li) { e.preventDefault(); pickSuggestion(+li.getAttribute("data-i")); }
+    });
     $("date").addEventListener("change", function () {
       updateDateNotice();
       if (state.search && !$("results").hidden) { state.search.date = $("date").value; render(); }
@@ -535,6 +756,12 @@
     });
     $("req-submit").addEventListener("click", submitRequest);
     $("quote-close").addEventListener("click", function () { $("request-dialog").close(); });
+    $("request-close").addEventListener("click", function () { $("request-dialog").close(); });
+    $("request-form").addEventListener("submit", function (e) { e.preventDefault(); submitRequest(); });
+    // Clicking the dimmed backdrop closes either dialog (Esc already does).
+    ["request-dialog", "requests-dialog"].forEach(function (id) {
+      $(id).addEventListener("click", function (e) { if (e.target === e.currentTarget) e.currentTarget.close(); });
+    });
     $("my-requests-btn").addEventListener("click", openRequests);
     $("requests-close").addEventListener("click", function () { $("requests-dialog").close(); });
   }

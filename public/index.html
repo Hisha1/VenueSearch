@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Venue Hunt</title>
+<meta name="description" content="Find restaurants and venues big enough for your party, then request availability and a quote.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="party.css?v=20261031">
+</head>
+<body>
+<div class="blobs" aria-hidden="true">
+  <span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span>
+</div>
+
+<header class="topbar">
+  <a class="logo" href="./">venue<span>hunt</span> 🎉</a>
+  <button class="pill ghost" id="my-requests-btn" type="button">My requests <span class="count" id="req-count">0</span></button>
+</header>
+
+<main>
+  <section class="hero">
+    <p class="eyebrow">✨ party planning, minus the spreadsheet</p>
+    <h1>Find a spot that fits <em>everyone</em>.</h1>
+    <p class="lede">Drop an address, pick how far you'll travel, and tell us who's coming. We'll find restaurants and venues big enough for the crew — then you can ask for availability and get a quote.</p>
+  </section>
+
+  <form class="search card" id="search-form" novalidate>
+    <div class="field wide">
+      <label for="address">Where's the party? 📍</label>
+      <input id="address" name="address" type="text" autocomplete="street-address" placeholder="123 Main St, Brooklyn, NY" required>
+    </div>
+
+    <fieldset class="field radius">
+      <legend>How far? 🚗</legend>
+      <div class="seg">
+        <input type="radio" name="radius" id="r1" value="1"><label for="r1">&lt; 1 mile</label>
+        <input type="radio" name="radius" id="r5" value="5" checked><label for="r5">&lt; 5 miles</label>
+        <input type="radio" name="radius" id="r10" value="10"><label for="r10">&lt; 10 miles</label>
+      </div>
+    </fieldset>
+
+    <div class="field">
+      <label for="guests">Total attendees 👯</label>
+      <input id="guests" name="guests" type="number" min="1" max="2000" step="1" placeholder="25" required>
+    </div>
+
+    <div class="field">
+      <label for="date">Party date 📅</label>
+      <input id="date" name="date" type="date" required>
+    </div>
+
+    <div class="field">
+      <label for="kind">Looking for</label>
+      <select id="kind" name="kind">
+        <option value="all">Anything goes</option>
+        <option value="restaurant">Restaurants</option>
+        <option value="bar">Bars &amp; pubs</option>
+        <option value="venue">Event spaces &amp; halls</option>
+      </select>
+    </div>
+
+    <div class="actions">
+      <button class="pill primary" type="submit" id="search-btn">Find venues →</button>
+    </div>
+    <p class="form-error" id="form-error" role="alert" hidden></p>
+  </form>
+
+  <div class="notice" id="date-notice" hidden></div>
+
+  <section class="results" id="results" hidden>
+    <div class="results-head">
+      <h2 id="results-title">Venues</h2>
+      <div class="results-tools">
+        <label class="sr-only" for="sort">Sort</label>
+        <select id="sort">
+          <option value="distance">Closest first</option>
+          <option value="capacity">Biggest first</option>
+          <option value="price">Cheapest first</option>
+        </select>
+      </div>
+    </div>
+    <p class="results-sub" id="results-sub"></p>
+    <div class="results-grid">
+      <div id="map" class="map card" role="img" aria-label="Map of venues"></div>
+      <ul class="venue-list" id="venue-list"></ul>
+    </div>
+  </section>
+
+  <div class="loading" id="loading" hidden>
+    <div class="spinner"></div>
+    <p id="loading-text">Scouting the neighborhood…</p>
+  </div>
+</main>
+
+<footer class="foot">
+  Venue data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors. Capacities without a listed number and all quotes are estimates until the venue confirms.
+</footer>
+
+<!-- Request / quote modal -->
+<dialog id="request-dialog" class="modal">
+  <form method="dialog" id="request-form" class="modal-body">
+    <button class="close" value="cancel" type="submit" aria-label="Close">✕</button>
+    <p class="eyebrow" id="req-venue-type"></p>
+    <h3 id="req-venue-name">Venue</h3>
+    <p class="muted" id="req-venue-meta"></p>
+
+    <div class="req-grid">
+      <div class="field"><label for="req-date">Date</label><input id="req-date" type="date" required></div>
+      <div class="field"><label for="req-time">Start time</label><input id="req-time" type="time" value="19:00" required></div>
+      <div class="field"><label for="req-hours">Hours</label>
+        <select id="req-hours"><option>2</option><option selected>3</option><option>4</option><option>5</option></select>
+      </div>
+      <div class="field"><label for="req-guests">Guests</label><input id="req-guests" type="number" min="1" required></div>
+      <div class="field wide"><label for="req-style">Food &amp; drink</label>
+        <select id="req-style">
+          <option value="drinks">Drinks + light bites</option>
+          <option value="buffet" selected>Buffet / family style</option>
+          <option value="seated">Seated dinner</option>
+        </select>
+      </div>
+      <div class="field"><label for="req-name">Your name</label><input id="req-name" type="text" autocomplete="name" required></div>
+      <div class="field"><label for="req-email">Email</label><input id="req-email" type="email" autocomplete="email" required></div>
+      <div class="field wide"><label for="req-notes">Anything else? <span class="muted">(optional)</span></label>
+        <textarea id="req-notes" rows="2" placeholder="Birthday! Need a cake table and a mic."></textarea></div>
+    </div>
+    <p class="form-error" id="req-error" role="alert" hidden></p>
+    <div class="modal-actions">
+      <button class="pill primary" type="button" id="req-submit">Request availability &amp; quote</button>
+    </div>
+  </form>
+
+  <div class="modal-body" id="quote-view" hidden>
+    <button class="close" type="button" id="quote-close" aria-label="Close">✕</button>
+    <p class="eyebrow">🎟️ request saved</p>
+    <h3 id="quote-title">Your quote</h3>
+    <p class="muted" id="quote-sub"></p>
+    <table class="quote-table" id="quote-table"></table>
+    <p class="fine">This is an estimate built from typical prices for this kind of venue. Availability and final pricing are confirmed by the venue. Send them your request below.</p>
+    <div class="modal-actions wrap" id="quote-actions"></div>
+  </div>
+</dialog>
+
+<!-- My requests drawer -->
+<dialog id="requests-dialog" class="modal">
+  <div class="modal-body">
+    <button class="close" type="button" id="requests-close" aria-label="Close">✕</button>
+    <p class="eyebrow">📬 your asks</p>
+    <h3>My requests</h3>
+    <ul class="req-list" id="req-list"></ul>
+  </div>
+</dialog>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="party.js?v=20261031"></script>
+</body>
+</html>

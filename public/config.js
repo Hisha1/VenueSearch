@@ -1,13 +1,10 @@
-/* Site settings. Both values are optional.
- *
- * googleMapsApiKey: a Google Maps Platform browser key with the "Places API (New)" and
- *   "Maps JavaScript API" enabled. Restrict it to this site's domain (HTTP referrer) in
- *   Google Cloud. With a key, address suggestions come from Google; without one they come
- *   from OpenStreetMap (Photon), which is free and needs no key.
+/* Site settings (optional).
  *
  * requestEndpoint: a URL that receives each availability/quote request as a JSON POST.
+ *
+ * The Google Places key is NOT set here: it is a secret on the Cloudflare Worker
+ * (GOOGLE_PLACES_KEY), so it never reaches the browser. See README.md.
  */
 window.VENUE_HUNT_CONFIG = Object.assign({
-  googleMapsApiKey: "",
   requestEndpoint: ""
 }, window.VENUE_HUNT_CONFIG || {});

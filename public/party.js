@@ -2,7 +2,7 @@
 (function () {
   "use strict";
 
-  // Settings live in config.js (Google Maps key for address suggestions, optional request endpoint).
+  // Settings live in config.js (optional request endpoint). The Google key lives on the server.
   var CONFIG = window.VENUE_HUNT_CONFIG || {};
 
   var MIN_DAYS_NOTICE = 5;
@@ -108,27 +108,35 @@
       ");out center tags 800;";
   }
 
-  // Get venues within `miles`. First straight from the public OpenStreetMap (Overpass)
-  // servers: one is asked right away, the next joins if it is slow or fails, first good answer
-  // wins. If none of them answer, the site's own /api/venues (a Cloudflare Worker that asks the
-  // same servers from Cloudflare and caches results) is tried. Nothing runs past `deadline`.
+  // Get venues for one ring. The site's own /api/venues goes first: with a Google Places key it
+  // answers for the whole radius at once (closest first). If that route is missing or fails,
+  // the public OpenStreetMap (Overpass) servers are asked directly for the ring.
+  // Resolves to { venues, source, covered }. Nothing runs past `deadline`.
   function fetchVenues(o, miles, deadline) {
-    return fetchDirect(o, miles, deadline).catch(function (directErr) {
-      var left = deadline - Date.now();
-      if (left < 1500) throw directErr;
-      var url = "/api/venues?lat=" + o.lat.toFixed(5) + "&lon=" + o.lon.toFixed(5) + "&miles=" + miles;
-      return fetchJSON(url, {}, left).then(function (json) {
-        return (json.elements || []).map(function (el) { return toVenue(el, o); }).filter(Boolean);
-      }).catch(function (err) {
-        throw new Error(directErr.message === "BUSY" || /429|50\d/.test(err.message) ? "BUSY" : directErr.message);
+    var s = state.search;
+    var url = "/api/venues?lat=" + o.lat.toFixed(5) + "&lon=" + o.lon.toFixed(5) + "&miles=" + miles +
+      "&radius=" + s.radius + "&kind=" + encodeURIComponent(s.kind);
+    var serverBudget = Math.min(15000, deadline - Date.now() - 4000);
+    var viaServer = state.serverDown || serverBudget < 1500
+      ? Promise.reject(new Error("SKIP"))
+      : fetchJSON(url, {}, serverBudget);
+    return viaServer.then(function (json) {
+      return {
+        venues: (json.elements || []).map(function (el) { return toVenue(el, o); }).filter(Boolean),
+        source: json.source || "openstreetmap",
+        covered: json.covered || miles
+      };
+    }, function (serverErr) {
+      if (/HTTP 404|HTTP 405/.test(serverErr.message)) state.serverDown = true; // no Worker deployed
+      return fetchDirect(o, miles, deadline).then(function (venues) {
+        return { venues: venues, source: "openstreetmap", covered: miles };
       });
     });
   }
 
   function fetchDirect(o, miles, deadline) {
     var body = "data=" + encodeURIComponent(overpassQuery(o, miles));
-    // Leave time for the /api/venues fallback.
-    var budget = Math.min(REQUEST_TIMEOUT_MS, deadline - Date.now() - 6000);
+    var budget = Math.min(REQUEST_TIMEOUT_MS, deadline - Date.now());
     if (budget < 1000) return Promise.reject(new Error("TIMEOUT"));
     return new Promise(function (resolve, reject) {
       var started = {}, ctrls = [], timers = [], failures = 0, busy = false, done = false;
@@ -232,45 +240,27 @@
 
   /* ---------- address autocomplete + validation ---------- */
 
-  // Suggestions come from Google Places (when CONFIG.googleMapsApiKey is set) or from
-  // Photon, a free OpenStreetMap address search. Picking a suggestion validates the address
-  // and gives us its exact coordinates.
-  var addr = { selected: null, items: [], active: -1, seq: 0, timer: null, google: null, googleFailed: false, token: null };
+  // Suggestions come from Google Places through the site's /api/autocomplete (the key stays on
+  // the server), or from Photon, a free OpenStreetMap address search, when Google isn't set up.
+  // Picking a suggestion validates the address and gives us its exact coordinates.
+  var addr = { selected: null, items: [], active: -1, seq: 0, timer: null, googleOff: false, session: "" };
 
-  function loadGoogle() {
-    if (addr.google) return addr.google;
-    addr.google = new Promise(function (resolve, reject) {
-      window.__venueHuntGoogleReady = function () {
-        google.maps.importLibrary("places").then(resolve, reject);
-      };
-      var s = document.createElement("script");
-      s.src = "https://maps.googleapis.com/maps/api/js?key=" + encodeURIComponent(CONFIG.googleMapsApiKey) +
-        "&loading=async&v=weekly&callback=__venueHuntGoogleReady";
-      s.async = true;
-      s.onerror = function () { reject(new Error("Google Maps failed to load")); };
-      document.head.appendChild(s);
-      setTimeout(function () { reject(new Error("Google Maps timed out")); }, 10000);
-    });
-    return addr.google;
+  function newSession() {
+    return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2);
   }
-  function useGoogle() { return !!CONFIG.googleMapsApiKey && !addr.googleFailed; }
+  function useGoogle() { return !addr.googleOff; }
 
   function googleSuggest(q) {
-    return loadGoogle().then(function (places) {
-      if (!addr.token) addr.token = new places.AutocompleteSessionToken();
-      return places.AutocompleteSuggestion.fetchAutocompleteSuggestions({ input: q, sessionToken: addr.token });
-    }).then(function (res) {
-      return (res.suggestions || []).filter(function (s) { return s.placePrediction; }).slice(0, 5).map(function (s) {
-        var p = s.placePrediction;
+    if (!addr.session) addr.session = newSession();
+    var session = addr.session;
+    return fetchJSON("/api/autocomplete?q=" + encodeURIComponent(q) + "&session=" + session, {}, 6000).then(function (json) {
+      return (json.suggestions || []).map(function (sg) {
         return {
-          main: p.mainText ? p.mainText.toString() : p.text.toString(),
-          sub: p.secondaryText ? p.secondaryText.toString() : "",
-          label: p.text.toString(),
+          main: sg.main, sub: sg.sub, label: sg.label || [sg.main, sg.sub].filter(Boolean).join(", "),
           resolve: function () {
-            var place = p.toPlace();
-            return place.fetchFields({ fields: ["formattedAddress", "location"] }).then(function () {
-              addr.token = null; // a pick ends the billing session
-              return { lat: place.location.lat(), lon: place.location.lng(), label: place.formattedAddress || p.text.toString() };
+            addr.session = ""; // a pick ends the billing session
+            return fetchJSON("/api/place?id=" + encodeURIComponent(sg.id) + "&session=" + session, {}, 6000).then(function (p) {
+              return { lat: p.lat, lon: p.lon, label: p.label || sg.label };
             });
           }
         };
@@ -295,7 +285,7 @@
 
   function suggest(q) {
     if (useGoogle()) {
-      return googleSuggest(q).catch(function () { addr.googleFailed = true; return photonSuggest(q); });
+      return googleSuggest(q).catch(function () { addr.googleOff = true; return photonSuggest(q); });
     }
     return photonSuggest(q);
   }
@@ -499,13 +489,15 @@
   // Fetch the next ring of venues. Failures are recorded in state.error (no fake data).
   function loadRing(run) {
     var miles = state.steps[state.stepIndex];
-    return fetchVenues(state.origin, miles, state.deadline).then(function (venues) {
+    return fetchVenues(state.origin, miles, state.deadline).then(function (r) {
       if (run !== state.run) return;
-      venues.forEach(function (v) {
+      r.venues.forEach(function (v) {
         if (!state.byId[v.id]) { state.byId[v.id] = v; state.venues.push(v); }
       });
-      state.covered = miles;
-      state.stepIndex++;
+      state.source = r.source;
+      state.covered = Math.max(miles, Math.min(r.covered, state.search.radius));
+      // Google answers for the whole radius at once, so skip the rings it already covered.
+      while (state.stepIndex < state.steps.length && state.steps[state.stepIndex] <= state.covered) state.stepIndex++;
       state.error = "";
     }, function (err) {
       if (run !== state.run) return;
@@ -572,7 +564,8 @@
       : state.error ? "Couldn't load venues" : "No spots fit " + s.guests + " guests";
     $("results-sub").textContent =
       "Within " + s.radius + " mi of " + state.origin.label.split(",").slice(0, 3).join(",") +
-      " · " + prettyDate(s.date) + " · showing " + shown.length + (more ? "" : " of " + list.length);
+      " · " + prettyDate(s.date) + " · showing " + shown.length + (more ? "" : " of " + list.length) +
+      (state.source === "google" ? " · venue data from Google" : "");
 
     var ul = $("venue-list");
     if (!shown.length && state.error) {
